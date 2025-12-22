@@ -1,16 +1,19 @@
 """
 Document management API endpoints
 """
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
-from sqlalchemy.orm import Session
-from typing import List
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.document import Document
 from app.services.document_processor import DocumentProcessor
-from app.core.config import settings
+from app.services.document_processor import DocumentProcessor
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
+from sqlalchemy.orm import Session
+from typing import List
+import asyncio
 import os
 import uuid
-from datetime import datetime
 
 router = APIRouter()
 
@@ -57,10 +60,13 @@ async def upload_document(
     db.add(document)
     db.commit()
     db.refresh(document)
-    
+
     # TODO: Trigger background processing
     # background_tasks.add_task(process_document_task, document.id, file_path, db)
     # For now, you can process synchronously or implement Celery
+    executor = ThreadPoolExecutor(max_workers=4)
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(executor, process_file_sync, file_path, document.id)
     
     return {
         "id": document.id,
@@ -68,6 +74,13 @@ async def upload_document(
         "status": document.processing_status,
         "message": "Document uploaded successfully. Processing will begin shortly."
     }
+
+
+def process_file_sync(file_path: str, document_id: int):
+    db = next(get_db())
+    processor = DocumentProcessor(db)
+    asyncio.run(processor.process_document(file_path, document_id))
+    db.close()
 
 
 @router.get("")
