@@ -1,6 +1,7 @@
 # FastAPI
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
+celery[redis]==5.5.2
 python-multipart==0.0.6
 
 # Database
@@ -15,8 +16,12 @@ pgvector==0.2.4
 redis==5.0.1
 
 # Docling (PDF Processing)
-docling==1.0.0
-docling-core==1.0.0
+docling>=2.56.0
+docling-core>=2.56.0
+deepsearch-toolkit>=2.0.1
+matplotlib>=3.8.0
+pandas>=2.1.0
+PyMuPDF>=1.26.0
 
 # AI/ML
 openai==1.10.0
@@ -26,8 +31,8 @@ sentence-transformers==2.3.1
 
 # Utilities
 python-dotenv==1.0.0
-pydantic==2.5.3
-pydantic-settings==2.1.0
+pydantic>=2.6.0,<3.0.0
+pydantic-settings>=2.3.0,<3.0.0
 
 # Image Processing
 Pillow==10.2.0
