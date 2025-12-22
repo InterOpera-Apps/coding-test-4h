@@ -7,13 +7,13 @@ TODO: Implement this service to:
 3. Perform similarity search
 4. Link related images and tables
 """
+from app.core.config import settings
+from app.models.document import DocumentChunk
+from sqlalchemy import select, bindparam, text
+from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional
 import numpy as np
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from app.models.document import DocumentChunk
-from app.core.config import settings
-
+import openai
 
 class VectorStore:
     """
@@ -63,7 +63,16 @@ class VectorStore:
         model = SentenceTransformer('all-MiniLM-L6-v2')
         return model.encode(text)
         """
-        raise NotImplementedError("Embedding generation not implemented yet")
+        client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)  
+
+        response = client.embeddings.create(
+            model=settings.OPENAI_EMBEDDING_MODEL,
+            input=text
+        )
+
+        embedding = response.data[0].embedding
+
+        return embedding
     
     async def store_chunk(
         self, 
@@ -92,7 +101,6 @@ class VectorStore:
         Returns:
             Created DocumentChunk
         """
-        raise NotImplementedError("Chunk storage not implemented yet")
     
     async def similarity_search(
         self,
@@ -139,7 +147,52 @@ class VectorStore:
                 }
             ]
         """
-        raise NotImplementedError("Similarity search not implemented yet")
+         # 1 - Generate embedding
+        embedding = await self.generate_embedding(query)
+        if hasattr(embedding, "tolist"):
+            embedding = embedding.tolist()
+        embedding = [float(x) for x in embedding]
+
+        # 2 - Convert to pgvector literal
+        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+        # 3 - Build raw SQL
+        sql = f"""
+        SELECT
+            id,
+            content,
+            page_number,
+            extra_metadata,
+            1 - (embedding <=> :query_embedding) AS score
+        FROM document_chunks
+        {"WHERE document_id = :document_id" if document_id else ""}
+        ORDER BY embedding <=> :query_embedding
+        LIMIT :k
+        """
+
+        params = {"query_embedding": embedding_str, "k": k}
+        if document_id:
+            params["document_id"] = document_id
+
+        result = self.db.execute(text(sql), params)
+        rows = result.all()
+
+        # 4 - Build output
+        output = []
+        for row in rows:
+            chunk_id, content, page_number, extra_metadata, score = row
+            related_images = extra_metadata.get("related_images", []) if extra_metadata else []
+            related_tables = extra_metadata.get("related_tables", []) if extra_metadata else []
+            output.append({
+                "content": content,
+                "score": float(score),
+                "page_number": page_number,
+                "metadata": extra_metadata or {},
+                "related_images": related_images,
+                "related_tables": related_tables
+            })
+
+        return output
     
     async def get_related_content(
         self,
