@@ -1,13 +1,14 @@
 """
 Chat API endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from typing import List, Optional
 from app.db.session import get_db
 from app.models.conversation import Conversation, Message
 from app.services.chat_engine import ChatEngine
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
+from typing import List, Optional
 
 router = APIRouter()
 
@@ -67,19 +68,12 @@ async def send_message(
     db.commit()
     
     # TODO: Process message with ChatEngine
-    # chat_engine = ChatEngine(db)
-    # result = await chat_engine.process_message(
-    #     conversation_id=conversation.id,
-    #     message=request.message,
-    #     document_id=request.document_id
-    # )
-    
-    # For now, return placeholder response
-    result = {
-        "answer": "This is a placeholder response. Implement ChatEngine to process messages.",
-        "sources": [],
-        "processing_time": 0.0
-    }
+    chat_engine = ChatEngine(db)
+    result = await chat_engine.process_message(
+        conversation_id=conversation.id,
+        message=request.message,
+        document_id=request.document_id
+    )
     
     # Save assistant message
     assistant_message = Message(

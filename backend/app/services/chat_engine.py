@@ -8,11 +8,14 @@ TODO: Implement this service to:
 4. Generate responses using LLM
 5. Support multi-turn conversations
 """
-from typing import Dict, Any, List, Optional
-from sqlalchemy.orm import Session
-from app.models.conversation import Conversation, Message
-from app.services.vector_store import VectorStore
 from app.core.config import settings
+from app.models.conversation import Conversation, Message
+from app.models.document import Document, DocumentChunk, DocumentImage, DocumentTable
+from app.services.vector_store import VectorStore
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from typing import Dict, Any, List, Optional
+import openai
 import time
 
 
@@ -99,8 +102,30 @@ class ChatEngine:
         # prompt = ChatPromptTemplate.from_messages([...])
         # chain = prompt | llm
         # response = chain.invoke({...})
-        
-        raise NotImplementedError("Message processing not implemented yet")
+        start_time = time.time()
+
+        # 1 - Load conversation history
+        history = await self._load_conversation_history(conversation_id)
+
+        # 2 - Search vector store for relevant context
+        context = await self._search_context(message, document_id=document_id)
+
+        # 3 - Find related images and tables
+        media = await self._find_related_media(context)
+
+        # 4 - Generate response using LLM
+        answer = await self._generate_response(message, context, history, media)
+
+        # 5- Format sources
+        sources = self._format_sources(context, media)
+
+        processing_time = time.time() - start_time
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "processing_time": processing_time
+        }
     
     async def _load_conversation_history(
         self,
@@ -122,7 +147,12 @@ class ChatEngine:
                 ...
             ]
         """
-        raise NotImplementedError("History loading not implemented yet")
+        stmt = select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at.desc()).limit(limit)
+        
+        result = self.db.execute(stmt)
+        messages = result.scalars().all()
+
+        return [{"role": m.role, "content": m.content} for m in reversed(messages)]
     
     async def _search_context(
         self,
@@ -138,7 +168,7 @@ class ChatEngine:
         - Filter by document if specified
         - Return relevant chunks with metadata
         """
-        raise NotImplementedError("Context search not implemented yet")
+        return await self.vector_store.similarity_search(query=query, document_id=document_id, k=k)
     
     async def _find_related_media(
         self,
@@ -171,7 +201,39 @@ class ChatEngine:
                 ]
             }
         """
-        raise NotImplementedError("Related media finding not implemented yet")
+        images, tables = [], []
+
+        # Gather image ids and table ids
+        image_ids = []
+        table_ids = []
+        for chunk in context_chunks:
+            image_ids.extend(chunk.get("related_images", []))
+            table_ids.extend(chunk.get("related_tables", []))
+
+        if image_ids:
+            stmt = select(DocumentImage).where(DocumentImage.id.in_(image_ids))
+            result = self.db.execute(stmt)
+            images = [
+                {
+                    "url": img.file_path,
+                    "caption": img.caption,
+                    "page": img.page_number
+                } for img in result.scalars().all()
+            ]
+
+        if table_ids:
+            stmt = select(DocumentTable).where(DocumentTable.id.in_(table_ids))
+            result = self.db.execute(stmt)
+            tables = [
+                {
+                    "url": tbl.image_path,
+                    "caption": tbl.caption,
+                    "page": tbl.page_number,
+                    "data": tbl.data
+                } for tbl in result.scalars().all()
+            ]
+
+        return {"images": images, "tables": tables}
     
     async def _generate_response(
         self,
@@ -198,7 +260,38 @@ class ChatEngine:
         - Ask LLM to cite sources
         - Format for good UX (bullet points, etc.)
         """
-        raise NotImplementedError("Response generation not implemented yet")
+        # Build system prompt
+        system_prompt = "You are a helpful assistant. Use the context and media to answer questions."
+
+        # Build context prompt
+        context_text = "\n".join(
+            [f"[Page {c['page_number']}]: {c['content']}" for c in context]
+        )
+
+        # Add image/table references
+        media_text = ""
+        for img in media.get("images", []):
+            media_text += f"[Image Page {img['page']}] {img['caption']}\n"
+        for tbl in media.get("tables", []):
+            media_text += f"[Table Page {tbl['page']}] {tbl['caption']}\n"
+
+        # Add history
+        history_text = "\n".join([f"{h['role']}: {h['content']}" for h in history])
+
+        # Combine into user prompt
+        user_prompt = f"{context_text}\n{media_text}\nConversation History:\n{history_text}\nUser: {message}"
+
+        client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            # temperature=0.2 # not support with current model gpt-5-mini
+        )
+
+        return response.choices[0].message.content
     
     def _format_sources(
         self,
