@@ -1233,16 +1233,53 @@ class DocumentProcessor:
             text = text[:max_text_length]
         
         chunks = []
-        chunk_size = settings.CHUNK_SIZE
-        chunk_overlap = settings.CHUNK_OVERLAP
+        chunk_size = settings.CHUNK_SIZE  # 1000 chars
+        chunk_overlap = settings.CHUNK_OVERLAP  # 200 chars
         
-        # Enforce maximum chunk size (prevent extremely long chunks)
-        max_chunk_size = 2000  # Maximum 2000 characters per chunk
-        if chunk_size > max_chunk_size:
-            chunk_size = max_chunk_size
+        # Industry standard: Minimum chunk size at natural boundaries
+        # This ensures chunks aren't too small while allowing more frequent chunking
+        # Target: ~5-7 chunks per page to reach 80-100 total for 15 pages
+        # Using 60% threshold (600 chars) to create chunks more frequently
+        min_chunk_size = int(chunk_size * 0.6)  # 600 chars minimum at natural boundaries
         
-        # Split by paragraphs first, then by sentences if needed
-        paragraphs = text.split('\n\n')
+        # Helper function to split text by separator
+        def _split_text_by_separator(text: str, separator: str) -> List[str]:
+            """Split text by separator and clean up."""
+            splits = text.split(separator)
+            return [s.strip() for s in splits if s.strip()]
+        
+        # Helper function to get overlap text from chunk
+        def _get_overlap_text(chunk_text: str, overlap_size: int) -> str:
+            """Get the last N characters for overlap."""
+            if len(chunk_text) <= overlap_size:
+                return chunk_text
+            # Try to get overlap at word boundary
+            overlap_start = len(chunk_text) - overlap_size
+            # Find nearest space before overlap_start
+            space_idx = chunk_text.rfind(' ', 0, overlap_start)
+            if space_idx > overlap_start - 100:  # If space is reasonably close
+                return chunk_text[space_idx + 1:]
+            return chunk_text[overlap_start:]
+        
+        # Helper function to create chunk if it meets minimum size
+        def _create_chunk_if_ready(chunk_text: str) -> bool:
+            """Create chunk if it meets minimum size and is valid. Returns True if chunk was created."""
+            if not chunk_text or len(chunk_text) < min_chunk_size:
+                return False
+            
+            if self._is_valid_text(chunk_text) and not ("b'\\x" in chunk_text or 'b"\\x' in chunk_text):
+                chunks.append({
+                    "content": chunk_text,
+                    "page_number": page_number,
+                    "chunk_index": chunk_index,
+                    "metadata": {}
+                })
+                return True
+            return False
+        
+        # Step 1: Split by paragraphs (double newlines)
+        paragraphs = _split_text_by_separator(text, '\n\n')
+        
         current_chunk = ""
         chunk_index = 0
         
@@ -1251,91 +1288,119 @@ class DocumentProcessor:
             if not para:
                 continue
             
-            # If paragraph fits in current chunk, add it
+            # Industry standard: Add paragraph if it fits, otherwise create chunk
+            # Check if adding this paragraph would exceed chunk_size
             if len(current_chunk) + len(para) + 2 <= chunk_size:
+                # Paragraph fits - add it to current chunk
                 if current_chunk:
                     current_chunk += "\n\n" + para
                 else:
                     current_chunk = para
-            else:
-                # Save current chunk if it exists and is valid
-                # Validate chunk before adding - double check for binary patterns
-                if current_chunk and self._is_valid_text(current_chunk):
-                    # Additional check: ensure no binary patterns slipped through
-                    if not ("b'\\x" in current_chunk or 'b"\\x' in current_chunk):
-                        chunks.append({
-                            "content": current_chunk,
-                            "page_number": page_number,
-                            "chunk_index": chunk_index,
-                            "metadata": {}
-                        })
-                        chunk_index += 1
-                    else:
-                        print(f"Skipping chunk on page {page_number} - contains binary byte string pattern")
                 
-                # If paragraph itself is too large, split by sentences
-                if len(para) > chunk_size:
-                    sentences = para.split('. ')
-                    current_chunk = ""
-                    for sentence in sentences:
-                        if len(current_chunk) + len(sentence) + 2 <= chunk_size:
-                            if current_chunk:
-                                current_chunk += ". " + sentence
-                            else:
-                                current_chunk = sentence
-                        else:
-                            # Validate chunk before adding
-                            chunk_to_add = current_chunk + "."
-                            if chunk_to_add and self._is_valid_text(chunk_to_add):
-                                # Additional check: ensure no binary patterns slipped through
-                                if not ("b'\\x" in chunk_to_add or 'b"\\x' in chunk_to_add):
-                                    chunks.append({
-                                        "content": chunk_to_add,
-                                        "page_number": page_number,
-                                        "chunk_index": chunk_index,
-                                        "metadata": {}
-                                    })
-                                    chunk_index += 1
-                                else:
-                                    print(f"Skipping chunk on page {page_number} - contains binary byte string pattern")
-                            
-                            # Start new chunk with overlap
-                            if chunk_overlap > 0 and chunks:
-                                # Get last few words from previous chunk for overlap
-                                prev_words = chunks[-1]["content"].split()[-chunk_overlap//10:]
-                                current_chunk = " ".join(prev_words) + " " + sentence
-                            else:
-                                current_chunk = sentence
-                    
-                    # Add remaining chunk - validate it first
-                    if current_chunk:
-                        current_chunk += "." if not current_chunk.endswith(".") else ""
-                        # Validate before continuing - skip if binary
-                        if not self._is_valid_text(current_chunk) or ("b'\\x" in current_chunk or 'b"\\x' in current_chunk):
-                            print(f"Skipping remaining chunk on page {page_number} - contains binary data")
-                            current_chunk = ""  # Clear it so it doesn't get added later
-                else:
+                # Industry standard: Create chunk at natural boundary (end of paragraph)
+                # if it meets minimum size, even if more could fit
+                # This creates more chunks while respecting semantic boundaries
+                # Check after adding each paragraph to create chunks more frequently
+                if len(current_chunk) >= min_chunk_size:
+                    if _create_chunk_if_ready(current_chunk):
+                        chunk_index += 1
+                        # Start new chunk with overlap
+                        overlap_text = _get_overlap_text(current_chunk, chunk_overlap)
+                        current_chunk = overlap_text if overlap_text else ""
+            elif len(current_chunk) >= min_chunk_size:
+                # Paragraph doesn't fit, but current chunk is already substantial
+                # Create chunk before adding the new paragraph
+                if _create_chunk_if_ready(current_chunk):
+                    chunk_index += 1
                     # Start new chunk with overlap
-                    if chunk_overlap > 0 and chunks:
-                        prev_words = chunks[-1]["content"].split()[-chunk_overlap//10:]
-                        current_chunk = " ".join(prev_words) + "\n\n" + para
-                    else:
-                        current_chunk = para
-        
-        # Add final chunk
-        if current_chunk:
-            # Validate final chunk before adding
-            if self._is_valid_text(current_chunk):
-                # Additional check: ensure no binary patterns slipped through
-                if not ("b'\\x" in current_chunk or 'b"\\x' in current_chunk):
-                    chunks.append({
-                        "content": current_chunk,
-                        "page_number": page_number,
-                        "chunk_index": chunk_index,
-                        "metadata": {}
-                    })
+                    overlap_text = _get_overlap_text(current_chunk, chunk_overlap)
+                    current_chunk = overlap_text + "\n\n" + para if overlap_text else para
+            else:
+                # Adding para would exceed chunk_size - create chunk first
+                if current_chunk:
+                    if _create_chunk_if_ready(current_chunk):
+                        chunk_index += 1
+                    
+                    # Start new chunk with overlap from previous chunk
+                    overlap_text = _get_overlap_text(current_chunk, chunk_overlap)
+                    current_chunk = overlap_text + "\n\n" + para if overlap_text else para
                 else:
-                    print(f"Skipping final chunk on page {page_number} - contains binary byte string pattern")
+                    # No current chunk, but para doesn't fit - need to split para
+                    current_chunk = para
+            
+            # If current chunk exceeds size after adding paragraph, split it by sentences
+            if len(current_chunk) > chunk_size:
+                # Split current chunk by sentences
+                sentences = _split_text_by_separator(current_chunk, '. ')
+                
+                # Process sentences
+                temp_chunk = ""
+                for sentence in sentences:
+                    # Add period back if it was removed
+                    if not sentence.endswith('.') and '.' in current_chunk:
+                        sentence += '.'
+                    
+                    # If sentence fits, add it
+                    if len(temp_chunk) + len(sentence) + 2 <= chunk_size:
+                        if temp_chunk:
+                            temp_chunk += " " + sentence
+                        else:
+                            temp_chunk = sentence
+                    else:
+                        # Adding sentence would exceed chunk_size - create chunk first
+                        if temp_chunk:
+                            if _create_chunk_if_ready(temp_chunk):
+                                chunk_index += 1
+                            
+                            # Start new temp_chunk with overlap
+                            overlap_text = _get_overlap_text(temp_chunk, chunk_overlap)
+                            temp_chunk = overlap_text + " " + sentence if overlap_text else sentence
+                        else:
+                            # Sentence itself is too large, split by characters
+                            if len(sentence) > chunk_size:
+                                # Split sentence into character chunks
+                                for i in range(0, len(sentence), chunk_size - chunk_overlap):
+                                    char_chunk = sentence[i:i + chunk_size]
+                                    if char_chunk and self._is_valid_text(char_chunk) and not ("b'\\x" in char_chunk or 'b"\\x' in char_chunk):
+                                        chunks.append({
+                                            "content": char_chunk,
+                                            "page_number": page_number,
+                                            "chunk_index": chunk_index,
+                                            "metadata": {}
+                                        })
+                                        chunk_index += 1
+                                temp_chunk = ""
+                            else:
+                                temp_chunk = sentence
+                    
+                    # Industry standard: Create chunk at natural boundary (end of sentence)
+                    # if it meets minimum size, even if more could fit
+                    if len(temp_chunk) >= min_chunk_size:
+                        if _create_chunk_if_ready(temp_chunk):
+                            chunk_index += 1
+                            # Start new temp_chunk with overlap
+                            overlap_text = _get_overlap_text(temp_chunk, chunk_overlap)
+                            temp_chunk = overlap_text if overlap_text else ""
+                    # Also create chunk if it reaches full chunk_size (standard behavior)
+                    elif len(temp_chunk) >= chunk_size:
+                        if _create_chunk_if_ready(temp_chunk):
+                            chunk_index += 1
+                            # Start new temp_chunk with overlap
+                            overlap_text = _get_overlap_text(temp_chunk, chunk_overlap)
+                            temp_chunk = overlap_text if overlap_text else ""
+                
+                # Update current_chunk with remaining temp_chunk
+                current_chunk = temp_chunk
+        
+        # Add final chunk if it exists (even if below minimum size, to avoid losing content)
+        if current_chunk:
+            if self._is_valid_text(current_chunk) and not ("b'\\x" in current_chunk or 'b"\\x' in current_chunk):
+                chunks.append({
+                    "content": current_chunk,
+                    "page_number": page_number,
+                    "chunk_index": chunk_index,
+                    "metadata": {}
+                })
         
         return chunks
     
