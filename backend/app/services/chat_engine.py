@@ -131,24 +131,8 @@ class ChatEngine:
             # Format sources
             sources = self._format_sources(context, media)
             
-            # Save user message
-            user_msg = Message(
-                conversation_id=conversation_id,
-                role="user",
-                content=message
-            )
-            self.db.add(user_msg)
-            self.db.commit()
-            
-            # Save assistant response
-            assistant_msg = Message(
-                conversation_id=conversation_id,
-                role="assistant",
-                content=answer,
-                sources=sources
-            )
-            self.db.add(assistant_msg)
-            self.db.commit()
+            # Note: Message saving is handled by the API layer (chat.py)
+            # to avoid duplicate entries in the database
             
             processing_time = time.time() - start_time
             

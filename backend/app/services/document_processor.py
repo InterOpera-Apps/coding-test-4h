@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.models.document import Document, DocumentChunk, DocumentImage, DocumentTable
 from app.services.vector_store import VectorStore
 from app.core.config import settings
+from app.utils.binary_validator import BinaryValidator
 import os
 import time
 import uuid
@@ -33,6 +34,7 @@ class DocumentProcessor:
     def __init__(self, db: Session):
         self.db = db
         self.vector_store = VectorStore(db)
+        self.binary_validator = BinaryValidator()
         # Initialize DocumentConverter with PDF format
         # DocumentConverter expects allowed_formats as a list
         self.converter = DocumentConverter(allowed_formats=[InputFormat.PDF])
@@ -151,8 +153,8 @@ class DocumentProcessor:
                 
                 # Also check for Python byte strings and binary headers
                 if not found_binary:
-                    if "b'\\x" in full_text_str or 'b"\\x' in full_text_str:
-                        print(f"Skipping full text extraction - contains Python byte string representations")
+                    if self.binary_validator.contains_binary_patterns(full_text_str):
+                        print(f"Skipping full text extraction - contains binary patterns")
                         found_binary = True
                     elif any(header.lower() in full_text_str.lower() for header in ['\\x89png', '\\xff\\xd8\\xff', 'lhdr']):
                         print(f"Skipping full text extraction - contains binary header patterns")
@@ -161,7 +163,7 @@ class DocumentProcessor:
                 if not found_binary:
                     # Sample a portion of the text to check for binary patterns
                     sample_text = full_text_str[:5000]  # Check first 5KB
-                    if not self._is_valid_text(sample_text):
+                    if not self.binary_validator.is_valid_text(sample_text):
                         print(f"Skipping full text extraction - sample validation failed (first 200 chars: {repr(sample_text[:200])})")
                         found_binary = True
                 
@@ -174,8 +176,8 @@ class DocumentProcessor:
                         print(f"Skipping full text extraction - text is very long ({len(full_text_str)} chars), may contain hidden binary data")
                     else:
                         # Clean and validate
-                        full_text_str = self._clean_markdown_text(full_text_str)
-                        if self._is_valid_text(full_text_str):
+                        full_text_str = self.binary_validator.clean_markdown_text(full_text_str)
+                        if self.binary_validator.is_valid_text(full_text_str):
                             chunks = self._chunk_text(full_text_str, document_id, 1)
                             if chunks:
                                 await self._save_text_chunks(chunks, document_id)
@@ -261,7 +263,7 @@ class DocumentProcessor:
                             if hasattr(item, 'text') and item.text:
                                 item_text = str(item.text)
                                 # Validate each item before adding
-                                if self._is_valid_text(item_text):
+                                if self.binary_validator.is_valid_text(item_text):
                                     page_text_parts.append(item_text)
                         if page_text_parts:
                             page_text = '\n\n'.join(page_text_parts)
@@ -288,73 +290,12 @@ class DocumentProcessor:
                             print(f"DEBUG Page {page_num} text sample: {sample}")
                     
                     # Early validation - check for obvious binary patterns first
-                    if page_text_str.startswith("b'") or page_text_str.startswith('b"'):
-                        print(f"Skipping page {page_num} text - detected Python byte string representation")
-                        continue
-                    
-                    # Check for binary patterns even if not at start - VERY AGGRESSIVE
-                    # Look for the exact pattern we see: b'\x89Png or b'\r\n\x1a
-                    if "b'\\x89" in page_text_str or 'b"\\x89' in page_text_str:
-                        print(f"Skipping page {page_num} text - contains b'\\x89 pattern (PNG header in byte string)")
-                        continue
-                    if "b'\\r\\n\\x1a" in page_text_str or 'b"\\r\\n\\x1a' in page_text_str:
-                        print(f"Skipping page {page_num} text - contains PNG header continuation pattern")
-                        continue
-                    
-                    # Check for embedded binary patterns (b'\x89Png, b'\r\n, etc.)
-                    # This catches binary data that's embedded in the middle of text
-                    import re
-                    should_skip_page = False
-                    
-                    # Check for ANY byte string pattern with hex escape sequences
-                    # Pattern: b' or b" followed by \x and hex digits
-                    byte_string_hex_pattern = r"b['\"].*?\\x[0-9a-fA-F]{2}"
-                    matches = re.findall(byte_string_hex_pattern, page_text_str, re.IGNORECASE)
-                    if len(matches) > 0:
-                        # If we find ANY byte string with hex escapes, it's suspicious
-                        # Count total occurrences
-                        total_byte_strings = page_text_str.count("b'") + page_text_str.count('b"')
-                        if total_byte_strings > 0:
-                            # Check if any contain PNG/JPEG patterns
-                            png_patterns = [r"\\x89Png", r"\\x89PNG", r"\\r\\n\\x1a", r"lhdr"]
-                            for png_pattern in png_patterns:
-                                if re.search(png_pattern, page_text_str, re.IGNORECASE):
-                                    print(f"Skipping page {page_num} text - contains binary PNG/JPEG pattern ({png_pattern})")
-                                    should_skip_page = True
-                                    break
-                            
-                            # If we have multiple byte strings with hex escapes, it's binary
-                            if not should_skip_page and len(matches) > 1:
-                                print(f"Skipping page {page_num} text - contains {len(matches)} byte string patterns with hex escapes (likely binary data)")
-                                should_skip_page = True
-                    
-                    # Also check for literal patterns (without regex)
-                    if not should_skip_page:
-                        binary_patterns = [
-                            "b'\\x89Png", 'b"\\x89Png', "b'\\x89PNG", 'b"\\x89PNG',
-                            "b'\\r\\n\\x1a", 'b"\\r\\n\\x1a',  # PNG header continuation
-                            "b'\\x00\\x00\\x00", 'b"\\x00\\x00\\x00',  # Multiple null bytes
-                        ]
-                        for pattern in binary_patterns:
-                            if pattern in page_text_str:
-                                print(f"Skipping page {page_num} text - contains binary pattern: {pattern[:20]}...")
-                                should_skip_page = True
-                                break
-                    
-                    # Check for byte strings with escape sequences anywhere in text
-                    if not should_skip_page:
-                        if "b'\\x" in page_text_str or 'b"\\x' in page_text_str:
-                            # Count occurrences - if ANY found, be very suspicious
-                            byte_string_count = page_text_str.count("b'\\x") + page_text_str.count('b"\\x')
-                            if byte_string_count > 0:
-                                print(f"Skipping page {page_num} text - contains {byte_string_count} byte string patterns with hex escapes (likely binary data)")
-                                should_skip_page = True
-                    
-                    if should_skip_page:
+                    if self.binary_validator.contains_binary_patterns(page_text_str):
+                        print(f"Skipping page {page_num} text - contains binary patterns")
                         continue
                     
                     # Quick validation - skip if looks like binary data
-                    if not self._is_valid_text(page_text_str):
+                    if not self.binary_validator.is_valid_text(page_text_str):
                         print(f"Skipping page {page_num} text extraction - appears to be binary data (length: {len(page_text_str)}, first 100 chars: {repr(page_text_str[:100])})")
                         continue
                     
@@ -365,11 +306,8 @@ class DocumentProcessor:
                         for chunk in chunks:
                             chunk_content = chunk.get("content", "")
                             # Check for binary patterns in chunk content
-                            if "b'\\x89" in chunk_content or 'b"\\x89' in chunk_content:
-                                print(f"Skipping chunk on page {page_num} - contains binary PNG pattern")
-                                continue
-                            if "b'\\r\\n\\x1a" in chunk_content or 'b"\\r\\n\\x1a' in chunk_content:
-                                print(f"Skipping chunk on page {page_num} - contains PNG header continuation")
+                            if self.binary_validator.contains_binary_patterns(chunk_content):
+                                print(f"Skipping chunk on page {page_num} - contains binary patterns")
                                 continue
                             clean_chunks.append(chunk)
                         
@@ -930,282 +868,6 @@ class DocumentProcessor:
                 "error": error_msg
             }
     
-    def _clean_markdown_text(self, text: str) -> str:
-        """
-        Clean markdown text by removing binary data sections.
-        Splits text into lines and filters out lines that look like binary data.
-        """
-        if not text:
-            return ""
-        
-        lines = text.split('\n')
-        cleaned_lines = []
-        removed_count = 0
-        
-        for line in lines:
-            line_stripped = line.strip()
-            # Skip empty lines
-            if not line_stripped:
-                cleaned_lines.append(line)
-                continue
-            
-            # Skip lines that look like binary data
-            # Check for Python byte string representations (b'... or b"...)
-            if line_stripped.startswith("b'") or line_stripped.startswith('b"'):
-                removed_count += 1
-                continue
-            
-            # Check if line contains byte string patterns anywhere (not just at start)
-            if "b'\\x" in line_stripped or 'b"\\x' in line_stripped:
-                removed_count += 1
-                continue
-            
-            # Check for excessive escape sequences in this line
-            escape_count = line_stripped.count('\\x')
-            if escape_count > 5:  # More than 5 escape sequences in one line (reduced from 10)
-                removed_count += 1
-                continue
-            
-            # Check for binary patterns (PNG, JPEG headers)
-            line_lower = line_stripped.lower()
-            if '\\x89png' in line_lower or '\\x89png' in line_lower:
-                removed_count += 1
-                continue
-            if '\\xff\\xd8\\xff' in line_lower:  # JPEG header
-                removed_count += 1
-                continue
-            if 'lhdr' in line_lower and escape_count > 2:  # PNG chunk header with escape sequences
-                removed_count += 1
-                continue
-            
-            # Check if line is mostly non-printable
-            printable_count = sum(1 for c in line_stripped if c.isprintable() or c.isspace())
-            if len(line_stripped) > 0 and printable_count / len(line_stripped) < 0.6:  # Stricter threshold
-                removed_count += 1
-                continue
-            
-            # Check for lines that are mostly hex/escape sequences
-            hex_like_chars = sum(1 for c in line_stripped if c in '0123456789abcdefABCDEF\\x')
-            if len(line_stripped) > 20 and hex_like_chars / len(line_stripped) > 0.4:  # More than 40% hex-like
-                removed_count += 1
-                continue
-            
-            # Line looks okay, keep it
-            cleaned_lines.append(line)
-        
-        if removed_count > 0:
-            print(f"Cleaned markdown: removed {removed_count} lines containing binary data")
-        
-        return '\n'.join(cleaned_lines)
-    
-    def _is_valid_text(self, text: str, min_printable_ratio: float = 0.8) -> bool:
-        """
-        Check if text is valid readable text (not binary data).
-        
-        Args:
-            text: Text to validate
-            min_printable_ratio: Minimum ratio of printable characters (default 0.8)
-        
-        Returns:
-            True if text appears to be valid readable text
-        """
-        if not text or len(text) == 0:
-            return False
-        
-        # Check length - if too long, likely binary data
-        if len(text) > 50000:  # 50KB limit (reduced from 100KB)
-            return False
-        
-        # Check for Python byte string representations (b'...', b"...")
-        # Check both at start and anywhere in text (might be embedded)
-        text_stripped = text.strip()
-        if text_stripped.startswith("b'") or text_stripped.startswith('b"'):
-            return False
-        
-        # Check if text contains Python byte string representations anywhere
-        # Look for patterns like b'\x89PNG', b'\x89Png, b'\r\n, etc.
-        # ANY occurrence of b'\x or b"\x is suspicious
-        if "b'\\x" in text or 'b"\\x' in text:
-            return False
-        
-        # Check for byte strings with escape sequences (b'\r, b'\n, b'\x00, etc.)
-        byte_string_patterns = ["b'\\r", 'b"\\r', "b'\\n", 'b"\\n', "b'\\x00", 'b"\\x00', "b'\\x89", 'b"\\x89']
-        for pattern in byte_string_patterns:
-            if pattern in text:
-                return False
-        
-        # Check for byte string patterns like b'\x89Png (common PNG header in byte strings)
-        # Check multiple variations and case-insensitive
-        png_byte_patterns = [
-            "b'\\x89Png", 'b"\\x89Png', "b'\\x89PNG", 'b"\\x89PNG',
-            "b'\\x89png", 'b"\\x89png',  # lowercase variant
-            "b'\\x89Png\\r", 'b"\\x89Png\\r',  # with carriage return
-            "b'\\x89Png\\r\\n", 'b"\\x89Png\\r\\n',  # with CRLF
-            "b'\\x89Png\\r\\n\\x1a", 'b"\\x89Png\\r\\n\\x1a',  # PNG header continuation
-            "b'\\x89Png\\r\\n\\x1a\\n", 'b"\\x89Png\\r\\n\\x1a\\n',  # Full PNG header start
-        ]
-        for pattern in png_byte_patterns:
-            if pattern in text:
-                return False
-        
-        # Also check using regex for more flexible matching
-        import re
-        png_regex_patterns = [
-            r"b['\"]\\x89Png",  # Case-insensitive PNG header
-            r"b['\"]\\r\\n\\x1a\\n",  # PNG header continuation
-            r"b['\"]\\x00\\x00\\x00",  # Multiple null bytes (common in binary)
-        ]
-        for pattern in png_regex_patterns:
-            if re.search(pattern, text, re.IGNORECASE):
-                return False
-        
-        # Check for byte strings with lhdr (PNG chunk header)
-        # If text contains b' or b" AND lhdr, it's likely binary
-        if ("b'" in text or 'b"' in text) and 'lhdr' in text.lower():
-            return False
-        
-        # More aggressive: if text contains b' or b" followed by escape sequences, it's binary
-        # Check for patterns like b'\x... anywhere in text
-        import re
-        byte_string_with_escape = re.search(r"b['\"].*?\\x[0-9a-fA-F]{2}", text)
-        if byte_string_with_escape:
-            # Count how many escape sequences follow b' or b"
-            matches = re.findall(r"b['\"].*?\\x[0-9a-fA-F]{2}", text)
-            if len(matches) > 2:  # More than 2 occurrences is definitely binary
-                return False
-            # Even 1-2 occurrences with PNG-like patterns is suspicious
-            if any('png' in match.lower() or 'lhdr' in match.lower() for match in matches):
-                return False
-        
-        # Check for common binary data patterns in string form
-        binary_string_patterns = [
-            "\\x89PNG",  # PNG header as string
-            "\\x89Png",  # PNG header (case variant)
-            "\\xff\\xd8\\xff",  # JPEG header as string
-            "lhdr",  # PNG chunk header (but only if combined with escape sequences)
-            "\\x00\\x00\\x00",  # Multiple null bytes as string
-            "\\r\\n\\x1a\\n",  # PNG header continuation
-        ]
-        text_lower = text.lower()
-        binary_pattern_count = 0
-        for pattern in binary_string_patterns:
-            count = text_lower.count(pattern.lower())
-            if count > 0:
-                binary_pattern_count += count
-                # If we find PNG/JPEG headers, it's definitely binary
-                if "png" in pattern.lower() or "jpeg" in pattern.lower() or "\\xff\\xd8" in pattern.lower():
-                    if count >= 1:
-                        return False
-        
-        # If we have many binary patterns, it's likely binary data
-        if binary_pattern_count > 3:
-            return False
-        
-        # Count printable characters
-        printable_count = sum(1 for c in text if c.isprintable() or c.isspace())
-        printable_ratio = printable_count / len(text) if len(text) > 0 else 0
-        
-        # Check for binary patterns in actual bytes (PNG, JPEG headers, etc.)
-        try:
-            text_bytes = text.encode('utf-8', errors='ignore')[:200]  # Check first 200 bytes
-            binary_patterns = [
-                b'\x89PNG',  # PNG header
-                b'\xff\xd8\xff',  # JPEG header
-                b'\x00\x00\x00\x00',  # Multiple null bytes
-            ]
-            for pattern in binary_patterns:
-                if pattern in text_bytes:
-                    return False
-        except:
-            pass
-        
-        # Check for excessive non-printable characters
-        if printable_ratio < min_printable_ratio:
-            return False
-        
-        # Check for excessive escape sequences (like \x89, \xa4, etc.)
-        # Lower threshold - even 2% is suspicious for text content
-        escape_seq_count = text.count('\\x')
-        if escape_seq_count > 0:
-            escape_ratio = escape_seq_count / len(text) if len(text) > 0 else 0
-            if escape_ratio > 0.02:  # More than 2% escape sequences (very strict)
-                return False
-            # If we have many escape sequences, it's likely binary
-            if escape_seq_count > 20:  # Reduced from 50 - even 20 is suspicious
-                return False
-        
-        # Check for patterns like b'\x89Png or b'\r\n\x1a\n (PNG headers in byte strings)
-        # These are strong indicators of binary data, even if ratio is low
-        if "b'\\x89" in text or 'b"\\x89' in text:
-            # If we find PNG header patterns, it's definitely binary
-            return False
-        if "b'\\r\\n\\x1a" in text or 'b"\\r\\n\\x1a' in text:
-            # PNG header continuation
-            return False
-        
-        # Check for excessive null bytes
-        null_byte_count = text.count('\x00')
-        if null_byte_count > 0:
-            null_ratio = null_byte_count / len(text) if len(text) > 0 else 0
-            if null_ratio > 0.02:  # More than 2% null bytes (reduced from 5%)
-                return False
-            # If we have many null bytes, it's likely binary
-            if null_byte_count > 20:
-                return False
-        
-        # Check for excessive non-ASCII characters that aren't common in text
-        # Count bytes that are outside normal ASCII printable range
-        non_ascii_count = sum(1 for c in text if ord(c) > 127 and not c.isprintable())
-        if non_ascii_count > len(text) * 0.1:  # More than 10% non-printable non-ASCII
-            return False
-        
-        # Check if text looks like it's mostly hex/escape sequences
-        # If more than 30% of characters are part of escape sequences or hex, it's likely binary
-        hex_like_chars = sum(1 for c in text if c in '0123456789abcdefABCDEF\\x')
-        if len(text) > 100 and hex_like_chars / len(text) > 0.3:
-            # But allow if it's clearly readable text with some hex
-            if escape_seq_count / len(text) > 0.02:  # If escape sequences are significant
-                return False
-        
-        # Check for corrupted escape sequences (like "x10", "x42", "x9477" without backslash)
-        # Pattern: letter 'x' followed by hex digits, repeated many times
-        import re
-        # Match patterns like x9477, x834, xa6c4, etc. (corrupted Unicode escapes)
-        corrupted_hex_pattern = re.compile(r'x[0-9a-fA-F]{2,}')
-        corrupted_hex_matches = corrupted_hex_pattern.findall(text)
-        if len(corrupted_hex_matches) > 5:  # More than 5 occurrences is suspicious
-            # Check if it's a significant portion of the text
-            total_corrupted_length = sum(len(m) for m in corrupted_hex_matches)
-            if len(text) > 100 and total_corrupted_length / len(text) > 0.05:  # More than 5% corrupted hex
-                return False
-            # Also check if we have many consecutive corrupted hex sequences
-            if len(corrupted_hex_matches) > 20:  # Many occurrences
-                return False
-        
-        # Check for patterns like "x10421", "x1xx", "x51xx" - corrupted binary data
-        corrupted_binary_pattern = re.compile(r'x[0-9a-fA-F]{2,}x{2,}')
-        if corrupted_binary_pattern.search(text):
-            return False
-        
-        # Check for sequences of corrupted hex like "x9477x834xa6c4" (common pattern)
-        consecutive_corrupted = re.compile(r'x[0-9a-fA-F]{2,}(?:x[0-9a-fA-F]{2,}){3,}')
-        if consecutive_corrupted.search(text):
-            return False
-        
-        # Check for patterns like "ub0x0b", "5b0x0b" - corrupted Unicode escape sequences
-        # Pattern: letter/digit + hex + "x0x0b"
-        corrupted_unicode_pattern = re.compile(r'[a-z0-9]{1,2}[0-9a-fA-F]{1,2}x0x0b', re.IGNORECASE)
-        unicode_corrupted_matches = corrupted_unicode_pattern.findall(text)
-        if len(unicode_corrupted_matches) > 2:  # More than 2 occurrences is suspicious
-            return False
-        
-        # Check for repeated patterns like "ub0x0bub0x0b" or similar
-        repeated_corrupted = re.compile(r'([a-z0-9]{1,2}[0-9a-fA-F]{1,2}x0x0b){2,}', re.IGNORECASE)
-        if repeated_corrupted.search(text):
-            return False
-        
-        return True
-    
     def _chunk_text(self, text: str, document_id: int, page_number: int) -> List[Dict[str, Any]]:
         """
         Split text into chunks for vector storage.
@@ -1222,7 +884,7 @@ class DocumentProcessor:
             return []
         
         # Validate text - skip if it's binary data
-        if not self._is_valid_text(text):
+        if not self.binary_validator.is_valid_text(text):
             print(f"Skipping invalid text on page {page_number} (likely binary data, length: {len(text)})")
             return []
         
@@ -1267,7 +929,7 @@ class DocumentProcessor:
             if not chunk_text or len(chunk_text) < min_chunk_size:
                 return False
             
-            if self._is_valid_text(chunk_text) and not ("b'\\x" in chunk_text or 'b"\\x' in chunk_text):
+            if self.binary_validator.is_valid_text(chunk_text) and not self.binary_validator.contains_binary_patterns(chunk_text):
                 chunks.append({
                     "content": chunk_text,
                     "page_number": page_number,
@@ -1361,7 +1023,7 @@ class DocumentProcessor:
                                 # Split sentence into character chunks
                                 for i in range(0, len(sentence), chunk_size - chunk_overlap):
                                     char_chunk = sentence[i:i + chunk_size]
-                                    if char_chunk and self._is_valid_text(char_chunk) and not ("b'\\x" in char_chunk or 'b"\\x' in char_chunk):
+                                    if char_chunk and self.binary_validator.is_valid_text(char_chunk) and not self.binary_validator.contains_binary_patterns(char_chunk):
                                         chunks.append({
                                             "content": char_chunk,
                                             "page_number": page_number,
@@ -1394,7 +1056,7 @@ class DocumentProcessor:
         
         # Add final chunk if it exists (even if below minimum size, to avoid losing content)
         if current_chunk:
-            if self._is_valid_text(current_chunk) and not ("b'\\x" in current_chunk or 'b"\\x' in current_chunk):
+            if self.binary_validator.is_valid_text(current_chunk) and not self.binary_validator.contains_binary_patterns(current_chunk):
                 chunks.append({
                     "content": current_chunk,
                     "page_number": page_number,
@@ -1538,18 +1200,7 @@ class DocumentProcessor:
             full_caption = ' '.join(full_caption.split())
             
             # CRITICAL: Validate caption - filter out binary data
-            # Check for binary patterns in caption
-            if "b'\\x89" in full_caption or 'b"\\x89' in full_caption:
-                print(f"WARNING: Caption contains binary PNG pattern, filtering it out")
-                return None
-            if "b'\\r\\n\\x1a" in full_caption or 'b"\\r\\n\\x1a' in full_caption:
-                print(f"WARNING: Caption contains PNG header continuation, filtering it out")
-                return None
-            if "b'\\x" in full_caption or 'b"\\x' in full_caption:
-                print(f"WARNING: Caption contains byte string patterns, filtering it out")
-                return None
-            # Check if caption looks like binary data
-            if not self._is_valid_text(full_caption):
+            if not self.binary_validator.validate_caption(full_caption):
                 print(f"WARNING: Caption failed validation (likely binary data), filtering it out")
                 return None
             
@@ -1599,34 +1250,10 @@ class DocumentProcessor:
                     skipped_count += 1
                     continue
                 
-                # Aggressive validation - check for ANY binary patterns
-                import re
+                # Validate chunk content using BinaryValidator
                 content_str = str(content)
-                should_skip_chunk = False
-                
-                # Check for Python byte string representations (b'...)
-                if "b'\\x" in content_str or 'b"\\x' in content_str:
-                    print(f"Skipping chunk {chunk.get('chunk_index', '?')} on page {chunk.get('page_number', '?')} - contains Python byte string (binary data)")
-                    should_skip_chunk = True
-                
-                # Check for corrupted hex patterns
-                if not should_skip_chunk:
-                    corrupted_patterns = [
-                        r'x[0-9a-fA-F]{3,}',  # x9477, x834, etc.
-                        r'[a-z0-9]{1,2}[0-9a-fA-F]{1,2}x0x0b',  # ub0x0b, 5b0x0b
-                    ]
-                    for pattern in corrupted_patterns:
-                        if re.search(pattern, content_str, re.IGNORECASE):
-                            print(f"Skipping chunk {chunk.get('chunk_index', '?')} on page {chunk.get('page_number', '?')} - contains corrupted hex pattern ({pattern})")
-                            should_skip_chunk = True
-                            break
-                
-                # Final validation check
-                if not should_skip_chunk and not self._is_valid_text(content_str):
+                if not self.binary_validator.validate_chunk_content(content_str):
                     print(f"Skipping chunk {chunk.get('chunk_index', '?')} on page {chunk.get('page_number', '?')} - validation failed (length: {len(content_str)}, preview: {repr(content_str[:100])})")
-                    should_skip_chunk = True
-                
-                if should_skip_chunk:
                     skipped_count += 1
                     continue
                 
@@ -1740,18 +1367,7 @@ class DocumentProcessor:
             
             # CRITICAL: Validate caption before saving - filter out binary data
             if caption:
-                caption_str = str(caption).strip()
-                # Check for binary patterns
-                if "b'\\x89" in caption_str or 'b"\\x89' in caption_str:
-                    print(f"WARNING: Image caption contains binary PNG pattern, removing it")
-                    caption = None
-                elif "b'\\r\\n\\x1a" in caption_str or 'b"\\r\\n\\x1a' in caption_str:
-                    print(f"WARNING: Image caption contains PNG header continuation, removing it")
-                    caption = None
-                elif "b'\\x" in caption_str or 'b"\\x' in caption_str:
-                    print(f"WARNING: Image caption contains byte string patterns, removing it")
-                    caption = None
-                elif not self._is_valid_text(caption_str):
+                if not self.binary_validator.validate_caption(caption):
                     print(f"WARNING: Image caption failed validation (likely binary data), removing it")
                     caption = None
 
