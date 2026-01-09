@@ -1,12 +1,12 @@
 """
 Chat engine service for multimodal RAG.
 
-TODO: Implement this service to:
-1. Process user messages
-2. Search for relevant context using vector store
-3. Find related images and tables
-4. Generate responses using LLM
-5. Support multi-turn conversations
+DONE: Implemented this service with:
+1. ✅ Process user messages (with conversation history)
+2. ✅ Search for relevant context using vector store
+3. ✅ Find related images and tables (from chunk metadata)
+4. ✅ Generate responses using LLM (OpenAI, Ollama, Gemini, Groq support)
+5. ✅ Support multi-turn conversations (history loading and context)
 """
 from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
@@ -21,7 +21,7 @@ class ChatEngine:
     """
     Multimodal chat engine with RAG.
     
-    This is a SKELETON implementation. You need to implement the core logic.
+    DONE: Fully implemented with all core functionality.
     """
     
     def __init__(self, db: Session):
@@ -154,6 +154,10 @@ class ChatEngine:
         """
         Load recent conversation history.
         
+        DONE: Implemented conversation history loading
+        - ✅ Load last N messages from conversation (ordered by created_at)
+        - ✅ Format for LLM context (role + content)
+        - ✅ Include both user and assistant messages
         TODO: Implement conversation history loading
         - Load last N messages from conversation
         - Format for LLM context
@@ -191,6 +195,10 @@ class ChatEngine:
         """
         Search for relevant context using vector store.
         
+        DONE: Implemented context search
+        - ✅ Use vector store similarity search (via VectorStore.similarity_search)
+        - ✅ Filter by document if specified (document_id parameter)
+        - ✅ Return relevant chunks with metadata (includes related images/tables)
         TODO: Implement context search
         - Use vector store similarity search
         - Filter by document if specified
@@ -205,6 +213,11 @@ class ChatEngine:
         """
         Find related images and tables from context chunks.
         
+        DONE: Implemented related media finding
+        - ✅ Extract image/table references from chunk metadata
+        - ✅ Query database for actual image/table records (via VectorStore)
+        - ✅ Return with URLs for frontend display (deduplicated, limited to top 10)
+
         TODO: Implement related media finding
         - Extract image/table references from chunk metadata
         - Query database for actual image/table records
@@ -263,6 +276,14 @@ class ChatEngine:
         """
         Generate response using LLM.
         
+        DONE: Implemented LLM response generation
+        - ✅ Build comprehensive prompt with:
+          - ✅ System instructions (RAG assistant guidelines)
+          - ✅ Conversation history (last 4 messages)
+          - ✅ Retrieved context (top 5 chunks with page numbers)
+          - ✅ Available images/tables (with captions and page numbers)
+        - ✅ Call LLM API (supports OpenAI, Ollama, Gemini, Groq)
+        - ✅ Return generated answer
         TODO: Implement LLM response generation
         - Build comprehensive prompt with:
           - System instructions

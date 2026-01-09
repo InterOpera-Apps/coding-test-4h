@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.utils.binary_validator import BinaryValidator
 import fitz  # PyMuPDF
 import re
+import asyncio
 
 
 class TextExtractor:
@@ -67,10 +68,11 @@ class TextExtractor:
                 print(f"Created {len(chunks)} chunks from full text")
         
         # Step 2: Page-by-page extraction (more reliable, cleaner)
-        # Open PDF with PyMuPDF for reliable text extraction
+        # Open PDF with PyMuPDF for reliable text extraction (CPU-intensive, run in thread)
         pdf_doc_for_text = None
         try:
-            pdf_doc_for_text = fitz.open(file_path)
+            loop = asyncio.get_event_loop()
+            pdf_doc_for_text = await loop.run_in_executor(None, fitz.open, file_path)
             print(f"Opened PDF with PyMuPDF for text extraction: {len(pdf_doc_for_text)} pages")
         except Exception as e:
             print(f"Error opening PDF with PyMuPDF for text extraction: {e}")
@@ -504,35 +506,53 @@ class TextExtractor:
         saved_count = 0
         skipped_count = 0
         
+        # Filter and validate chunks first
+        valid_chunks = []
         for chunk in chunks:
-            try:
-                content = chunk.get("content", "")
-                
-                # Validate chunk content before saving - skip if binary data
-                if not content or not content.strip():
-                    skipped_count += 1
-                    continue
-                
-                # Validate chunk content using BinaryValidator
-                content_str = str(content)
-                if not self.binary_validator.validate_chunk_content(content_str):
-                    print(f"Skipping chunk {chunk.get('chunk_index', '?')} on page {chunk.get('page_number', '?')} - validation failed")
-                    skipped_count += 1
-                    continue
-                
-                # Store chunk with embedding via VectorStore
-                await self.vector_store.store_chunk(
-                    content=content,
+            content = chunk.get("content", "")
+            
+            # Validate chunk content before saving - skip if binary data
+            if not content or not content.strip():
+                skipped_count += 1
+                continue
+            
+            # Validate chunk content using BinaryValidator
+            content_str = str(content)
+            if not self.binary_validator.validate_chunk_content(content_str):
+                print(f"Skipping chunk {chunk.get('chunk_index', '?')} on page {chunk.get('page_number', '?')} - validation failed")
+                skipped_count += 1
+                continue
+            
+            valid_chunks.append(chunk)
+        
+        # Process chunks in batches of 10 to avoid overwhelming the system
+        # This allows concurrent embedding generation while preventing overload
+        batch_size = 10
+        for i in range(0, len(valid_chunks), batch_size):
+            batch = valid_chunks[i:i + batch_size]
+            
+            # Process batch concurrently (embeddings generated in parallel)
+            tasks = []
+            for chunk in batch:
+                task = self.vector_store.store_chunk(
+                    content=chunk.get("content", ""),
                     document_id=document_id,
                     page_number=chunk["page_number"],
                     chunk_index=chunk["chunk_index"],
                     metadata=chunk.get("metadata", {})
                 )
-                saved_count += 1
-            except Exception as e:
-                print(f"Error saving chunk: {e}")
-                skipped_count += 1
-                continue
+                tasks.append(task)
+            
+            # Wait for batch to complete (concurrent execution)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Count successes
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"Error saving chunk: {result}")
+                    skipped_count += 1
+                else:
+                    saved_count += 1
         
         if skipped_count > 0:
             print(f"Saved {saved_count} chunks, skipped {skipped_count} chunks (binary data or invalid)")

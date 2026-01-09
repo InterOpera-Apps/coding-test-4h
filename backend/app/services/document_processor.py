@@ -8,6 +8,19 @@ DONE: Implemented table extraction (via TableExtractor)
 DONE: Implemented content storage in database
 DONE: Implemented embedding generation for text chunks (via VectorStore)
 DONE: Implemented error handling with retry/recovery strategies
+
+Original TODO requirements from backend/app/services/before/document_processor.py:
+TODO: Implement this service to:
+1. Parse PDF documents using Docling
+2. Extract text, images, and tables
+3. Store extracted content in database
+4. Generate embeddings for text chunks
+
+All requirements have been implemented with additional enhancements:
+- Specialized extractor classes (TextExtractor, ImageExtractor, TableExtractor)
+- Error recovery strategies (retry with exponential backoff)
+- Binary data validation and filtering
+- CPU-intensive operations run in thread pools to prevent blocking
 """
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
@@ -26,6 +39,7 @@ class DocumentProcessor:
     """
     Process PDF documents and extract multimodal content.
     
+    DONE: Fully implemented with all core functionality.
     Orchestrates the extraction process using specialized extractor classes:
     - TextExtractor: Handles text extraction and chunking
     - ImageExtractor: Handles image extraction from Docling and PyMuPDF
@@ -54,10 +68,22 @@ class DocumentProcessor:
         Process a PDF document using Docling and extractors.
         
         DONE: Implemented complete document processing pipeline
-        - Parse PDF using Docling
-        - Extract text, images, and tables using specialized extractors
-        - Handle errors with retry/recovery strategies
-        - Update document status throughout the process
+        - ✅ Parse PDF using Docling (with retry logic)
+        - ✅ Extract text, images, and tables using specialized extractors
+        - ✅ Store extracted content in database
+        - ✅ Generate embeddings for text chunks (via VectorStore)
+        - ✅ Handle errors with retry/recovery strategies
+        - ✅ Update document status throughout the process
+
+        Implementation steps:
+        1. Update document status to 'processing'
+        2. Use Docling to parse the PDF
+        3. Extract and save text chunks
+        4. Extract and save images
+        5. Extract and save tables
+        6. Generate embeddings for text chunks
+        7. Update document status to 'completed'
+        8. Handle errors appropriately
         
         Error Recovery Strategy:
         1. Retry Docling parsing up to 3 times with exponential backoff
@@ -173,8 +199,14 @@ class DocumentProcessor:
         
         for attempt in range(max_retries):
             try:
-                # Parse PDF using Docling
-                result = self.converter.convert(file_path)
+                # Parse PDF using Docling (CPU-intensive, run in thread pool)
+                # This prevents blocking the event loop
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,  # Use default thread pool executor
+                    self.converter.convert,
+                    file_path
+                )
                 
                 # Get the document from result
                 doc = result.document if hasattr(result, 'document') else result
